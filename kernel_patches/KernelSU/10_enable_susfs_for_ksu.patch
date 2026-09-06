@@ -2940,10 +2940,10 @@ index 9c1874a2..dbf87206 100644
  {
      struct ksu_nuke_ext4_sysfs_cmd cmd;
 diff --git a/kernel/supercall/supercall.c b/kernel/supercall/supercall.c
-index c35ce873..2aeba105 100644
+index c35ce873..40a56fc4 100644
 --- a/kernel/supercall/supercall.c
 +++ b/kernel/supercall/supercall.c
-@@ -63,14 +63,14 @@ static int ksu_install_fd_with_permissions(unsigned int fd_flags, unsigned long
+@@ -63,21 +63,21 @@ static int ksu_install_fd_with_permissions(unsigned int fd_flags, unsigned long
  
      fd = get_unused_fd_flags(fd_flags);
      if (fd < 0) {
@@ -2960,6 +2960,14 @@ index c35ce873..2aeba105 100644
          put_unused_fd(fd);
          kfree(context);
          return PTR_ERR(filp);
+     }
+ 
+     fd_install(fd, filp);
+-    pr_info("ksu fd installed: %d for pid %d\n", fd, current->pid);
++    pr_info("%s fd installed: %d for pid %d\n", name, fd, current->pid);
+     return fd;
+ }
+ 
 @@ -113,53 +113,31 @@ static void ksu_install_fd_tw_func(struct callback_head *cb)
      kfree(tw);
  }
