@@ -1115,7 +1115,7 @@ index fbb6c44f..1b34903f 100644
  {
      struct policydb *policydb;
 diff --git a/kernel/feature/sucompat.c b/kernel/feature/sucompat.c
-index 3418600c..e2af260d 100644
+index 3418600c..e784aba5 100644
 --- a/kernel/feature/sucompat.c
 +++ b/kernel/feature/sucompat.c
 @@ -1,6 +1,3 @@
@@ -1138,14 +1138,14 @@ index 3418600c..e2af260d 100644
  
  #include "arch.h"
  #include "policy/allowlist.h"
-@@ -21,28 +24,36 @@
+@@ -21,28 +24,37 @@
  #include "klog.h" // IWYU pragma: keep
  #include "runtime/ksud.h"
  #include "feature/sucompat.h"
 +#include "feature/adb_root.h"
  #include "policy/app_profile.h"
 -#include "hook/syscall_hook.h"
--#include "supercall/supercall.h"
+ #include "supercall/supercall.h"
  #include "sulog/event.h"
 -#include "ksu.h"
 -#include "util.h"
@@ -1182,7 +1182,7 @@ index 3418600c..e2af260d 100644
      pr_info("su_compat: set to %d\n", enable);
      return 0;
  }
-@@ -63,6 +74,13 @@ static void __user *userspace_stack_buffer(const void *d, size_t len)
+@@ -63,6 +75,13 @@ static void __user *userspace_stack_buffer(const void *d, size_t len)
      return copy_to_user(p, d, len) ? NULL : p;
  }
  
@@ -1196,7 +1196,7 @@ index 3418600c..e2af260d 100644
  static char __user *ksud_user_path(void)
  {
      static const char ksud_path[] = KSUD_PATH;
-@@ -70,210 +88,187 @@ static char __user *ksud_user_path(void)
+@@ -70,210 +89,201 @@ static char __user *ksud_user_path(void)
      return userspace_stack_buffer(ksud_path, sizeof(ksud_path));
  }
  
@@ -1319,8 +1319,10 @@ index 3418600c..e2af260d 100644
 +        }
 +        ksu_sulog_emit_pending(pending_sucompat, ret, GFP_KERNEL);
 +        return 0;
-+    }
-+
+     }
+ 
+-do_orig_stat:
+-    return ksu_syscall_table[orig_nr](regs);
 +    if (likely(!strstr(filename->name, "/app_process") && !strstr(filename->name, "/adbd") && !strstr(filename->name, "/stub_zygote"))) {
 +        pr_info("susfs: mark no sucompat checks for pid: '%d', exec: '%s'\n", current->pid, filename->name);
 +        susfs_set_current_proc_no_su();
@@ -1328,10 +1330,8 @@ index 3418600c..e2af260d 100644
 +        //   the sus mounts, tho other susfs features still rely on proc_umounted check, but
 +        //   it is fine to not spoof for init spawned processes.
 +        return 0;
-     }
- 
--do_orig_stat:
--    return ksu_syscall_table[orig_nr](regs);
++    }
++
 +#ifdef CONFIG_COMPAT
 +    if (unlikely(envp_user->is_compat))
 +        ret = ksu_adb_root_handle_execveat(filename->name, (void ***)&envp_user->ptr.compat);
@@ -1370,28 +1370,28 @@ index 3418600c..e2af260d 100644
 -    if (execveat && ((int)PT_REGS_PARM1(regs) != AT_FDCWD || (int)PT_REGS_PARM5(regs) != 0))
 -        goto do_orig_execve;
 +    if (unlikely(!filename_ptr))
-+        return 0;
++        return -EINVAL;
  
 -    if (unlikely(!filename_user))
 -        goto do_orig_execve;
 +    filename = *filename_ptr;
 +    if (IS_ERR(filename))
-+        return 0;
++        return -EINVAL;
  
 -    if (!ksu_is_allow_uid_for_current(current_uid().val))
 -        goto do_orig_execve;
 +    if (!ksu_handle_execveat_init(filename, (struct user_arg_ptr*)argv_user, (struct user_arg_ptr*)envp_user))
-+        return 0;
++        return -EINVAL;
  
 -    addr = untagged_addr((unsigned long)*filename_user);
 -    fn = (const char __user *)addr;
 -    memset(path, 0, sizeof(path));
 +    if (!(__ksu_is_allow_uid_for_current(current_uid().val)))
-+        return 0;
++        return -EINVAL;
  
 -    ret = strncpy_from_user(path, fn, sizeof(path));
 +    if (likely(memcmp(filename->name, su_path, sizeof(su_path))))
-+        return 0;
++        return -EINVAL;
  
 -    if (ret < 0) {
 -        pr_warn("Access filename when execve failed: %ld", ret);
@@ -1399,20 +1399,23 @@ index 3418600c..e2af260d 100644
 +    if (current_chrooted())
 +    {
 +        pr_err("ksu_handle_execveat_sucompat: su found but NOT allowed! Because current process is running in chrooted environment\n");
-+        return 0;
++        return -EINVAL;
      }
  
 -    if (likely(memcmp(path, su_path, sizeof(su_path))))
 -        goto do_orig_execve;
--
++    ret = escape_with_root_profile();
+ 
 -    pr_info("sys_execve su found\n");
--
++    pr_info("ksu_handle_execveat_sucompat: su->ksud!\n");
++    memcpy((void *)filename->name, ksud_path, sizeof(ksud_path));
+ 
 -    tmp_fd = get_unused_fd_flags(O_CLOEXEC);
 -    if (tmp_fd < 0) {
 -        pr_err("alloc tmp fd err: %d\n", tmp_fd);
 -        goto do_orig_execve;
 -    }
-+    pr_info("ksu_handle_execveat_sucompat: su found\n");
++    pending_sucompat = ksu_sulog_capture_sucompat(filename->name, (struct user_arg_ptr*)argv_user, GFP_KERNEL);
  
 -    old_cred = override_creds(ksu_cred);
 -    ksud_file = filp_open(KSUD_PATH, O_PATH, 0);
@@ -1421,8 +1424,11 @@ index 3418600c..e2af260d 100644
 -        pr_err("open ksud err: %ld\n", PTR_ERR(ksud_file));
 -        put_unused_fd(tmp_fd);
 -        goto do_orig_execve;
--    }
-+    memcpy((void *)filename->name, ksud_path, sizeof(ksud_path));
++    const char __user *argv_user_ptr = get_user_arg_ptr(*((struct user_arg_ptr*)argv_user), 0);
++    if (!argv_user_ptr || IS_ERR(argv_user_ptr)) {
++        pr_err("!argv_user_ptr || IS_ERR(argv_user_ptr)\n");
++        return -EINVAL;
+     }
  
 -    fd_install(tmp_fd, ksud_file);
 -
@@ -1439,15 +1445,17 @@ index 3418600c..e2af260d 100644
 -    regs->__PT_PARM3_REG = (unsigned long)argv_user;
 -    regs->__PT_PARM2_REG = empty_user_path();
 -    regs->__PT_PARM1_REG = tmp_fd;
-+    pending_sucompat = ksu_sulog_capture_sucompat(filename->name, (struct user_arg_ptr*)argv_user, GFP_KERNEL);
++    ksu_sulog_emit_pending(pending_sucompat, ret, GFP_KERNEL);
  
-     ret = escape_with_root_profile();
--    if (ret) {
+-    ret = escape_with_root_profile();
+     if (ret) {
 -        pr_err("escape_with_root_profile failed: %ld\n", ret);
--    }
--    ksu_sulog_emit_pending(pending_sucompat, ret, GFP_KERNEL);
-+    if (ret)
 +        pr_err("escape_with_root_profile() failed: %d\n", ret);
++        return -EINVAL;
+     }
+-    ksu_sulog_emit_pending(pending_sucompat, ret, GFP_KERNEL);
++    return 0;
++}
  
 -    ret = ksu_syscall_table[__NR_execveat](regs);
 -    if (ret < 0) {
@@ -1464,16 +1472,17 @@ index 3418600c..e2af260d 100644
 -        if (su_fd < 0) {
 -            pr_warn("install su session fd failed: %d\n", su_fd);
 -        }
-+    const char __user *argv_user_ptr = get_user_arg_ptr(*((struct user_arg_ptr*)argv_user), 0);
-+    if (!argv_user_ptr || IS_ERR(argv_user_ptr)) {
-+        pr_err("!argv_user_ptr || IS_ERR(argv_user_ptr)\n");
-+        return 0;
++int ksu_handle_post_execveat_sucompat(int *fd, struct filename **filename_ptr,
++                 void *argv_user, void *envp_user,
++                 int *__never_use_flags, int *retval)
++{
++    if (*retval >= 0) {
++        (void)ksu_install_su_fd();
      }
 -    return ret;
- 
+-
 -do_orig_execve:
 -    return ksu_syscall_table[orig_nr](regs);
-+    ksu_sulog_emit_pending(pending_sucompat, ret, GFP_KERNEL);
 +    return 0;
  }
  
@@ -1509,6 +1518,7 @@ index 3418600c..e2af260d 100644
 +        pr_err("ksu_handle_faccessat: su found but NOT allowed! Because current process is running in chrooted environment\n");
 +        return 0;
 +    }
++
 +    pr_info("ksu_handle_faccessat: su->sh!\n");
 +    memcpy((void *)((*filename)->name), sh_path, sizeof(sh_path));
 +    return 0;
@@ -1526,6 +1536,7 @@ index 3418600c..e2af260d 100644
 +        pr_err("ksu_handle_stat: su found but NOT allowed! Because current process is running in chrooted environment\n");
 +        return 0;
 +    }
++
 +    pr_info("ksu_handle_stat: su->sh!\n");
 +    memcpy((void *)((*filename)->name), sh_path, sizeof(sh_path));
 +    return 0;
@@ -1570,7 +1581,7 @@ index 5e2cfe11..a4a6a7de 100644
 +#endif
 \ No newline at end of file
 diff --git a/kernel/hook/setuid_hook.c b/kernel/hook/setuid_hook.c
-index d3f3ac49..8210c0fa 100644
+index d3f3ac49..1f1e91be 100644
 --- a/kernel/hook/setuid_hook.c
 +++ b/kernel/hook/setuid_hook.c
 @@ -11,6 +11,8 @@
@@ -1582,7 +1593,7 @@ index d3f3ac49..8210c0fa 100644
  
  #include "policy/allowlist.h"
  #include "hook/setuid_hook.h"
-@@ -18,43 +20,142 @@
+@@ -18,43 +20,138 @@
  #include "manager/manager_identity.h"
  #include "infra/seccomp_cache.h"
  #include "supercall/supercall.h"
@@ -1627,7 +1638,6 @@ index d3f3ac49..8210c0fa 100644
 +        disable_seccomp();
 +        pr_info("install fd for manager: %d\n", ruid);
          ksu_install_fd();
-+        ksu_install_su_fd();
          return 0;
      }
  
@@ -1650,7 +1660,6 @@ index d3f3ac49..8210c0fa 100644
 +
 +    // Disable seccomp restriction for root allowed apps since running with "su" will disable seccomp anyway
 +    if (ksu_is_allow_uid_for_current(ruid)) {
-+        ksu_install_su_fd();
 +        disable_seccomp();
 +        return 0;
      }
@@ -1690,7 +1699,6 @@ index d3f3ac49..8210c0fa 100644
 +        disable_seccomp();
 +        pr_info("install fd for manager: %d\n", ruid);
 +        ksu_install_fd();
-+        ksu_install_su_fd();
 +        return 0;
 +    }
 +
@@ -1705,7 +1713,6 @@ index d3f3ac49..8210c0fa 100644
 +
 +    // Disable seccomp restriction for root allowed apps since running with "su" will disable seccomp anyway
 +    if (ksu_is_allow_uid_for_current(ruid)) {
-+        ksu_install_su_fd();
 +        disable_seccomp();
 +        return 0;
 +    }
@@ -1787,7 +1794,7 @@ index 879d58b4..11ab7d42 100644
      return !__ksu_is_allow_uid(uid);
  #else
 diff --git a/kernel/policy/app_profile.c b/kernel/policy/app_profile.c
-index 518ef414..62c43b03 100644
+index 518ef414..4cac7a74 100644
 --- a/kernel/policy/app_profile.c
 +++ b/kernel/policy/app_profile.c
 @@ -1,6 +1,3 @@
@@ -1863,7 +1870,20 @@ index 518ef414..62c43b03 100644
      if (test_thread_flag(TIF_KSU_DISABLE_ESCAPE_WITH_ROOT)) {
          pr_warn("TIF_KSU_DISABLE_ESCAPE_WITH_ROOT found, don't escape!\n");
          goto out_abort_creds;
-@@ -200,16 +172,13 @@ int escape_with_root_profile(void)
+@@ -191,7 +163,11 @@ int escape_with_root_profile(void)
+     }
+ #endif
+ 
+-    memcpy(&cred->cap_effective, &profile->capabilities.effective, sizeof(cred->cap_effective));
++    // setup capabilities
++    // we need CAP_DAC_READ_SEARCH becuase `/data/adb/ksud` is not accessible for non root process
++    // we add it here but don't add it to cap_inhertiable, it would be dropped automaticly after exec!
++    u64 cap_for_ksud = profile->capabilities.effective | CAP_DAC_READ_SEARCH;
++    memcpy(&cred->cap_effective, &cap_for_ksud, sizeof(cred->cap_effective));
+     memcpy(&cred->cap_permitted, &profile->capabilities.effective, sizeof(cred->cap_permitted));
+     memcpy(&cred->cap_bset, &profile->capabilities.effective, sizeof(cred->cap_bset));
+ 
+@@ -200,16 +176,13 @@ int escape_with_root_profile(void)
  
      commit_creds(cred);
  
@@ -1882,7 +1902,7 @@ index 518ef414..62c43b03 100644
      setup_mount_ns(profile->namespaces);
      ksu_put_root_profile(profile);
      return 0;
-@@ -221,31 +190,16 @@ out_abort_creds:
+@@ -221,31 +194,16 @@ out_abort_creds:
      return ret;
  }
  
